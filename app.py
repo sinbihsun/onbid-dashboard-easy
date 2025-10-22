@@ -1,9 +1,14 @@
+# --- app.py (수정본 전체) ---
+import os, sys
+# Streamlit Cloud에서 'src' 폴더를 파이썬 경로에 추가 (모듈 인식 문제 해결)
+sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 from datetime import datetime
 from dateutil.parser import parse
-from src.fetch_onbid import fetch_onbid_sample
+from fetch_onbid import fetch_onbid_sample  # ← src. 제거
 
 st.set_page_config(page_title="공매 진행현황 대시보드", layout="wide")
 
@@ -31,9 +36,18 @@ type_sel = st.sidebar.selectbox("공매종류", types)
 statuses = ["전체"] + sorted(df["status"].dropna().unique().tolist())
 status_sel = st.sidebar.selectbox("진행상태", statuses)
 
-min_date = df["start_date"].min()
-max_date = df["end_date"].max()
-date_range = st.sidebar.date_input("기간 (시작/종료)", value=(min_date, max_date))
+# 날짜 기본값이 NaT가 되지 않도록 안전 처리
+min_date = pd.to_datetime(df["start_date"].min())
+max_date = pd.to_datetime(df["end_date"].max())
+if pd.isna(min_date) or pd.isna(max_date):
+    # 데이터가 비어 있을 경우 대비한 기본값
+    min_date = pd.to_datetime("2025-01-01")
+    max_date = pd.to_datetime(datetime.today().date())
+
+date_range = st.sidebar.date_input(
+    "기간 (시작/종료)",
+    value=(min_date.date(), max_date.date())
+)
 
 # Apply filters
 filtered = df.copy()
@@ -57,24 +71,33 @@ with col1:
     st.plotly_chart(fig, use_container_width=True)
 
 with col2:
-    by_region = filtered.groupby("region").size().reset_index(name="count").sort_values("count", ascending=False).head(10)
+    by_region = (
+        filtered.groupby("region")
+        .size()
+        .reset_index(name="count")
+        .sort_values("count", ascending=False)
+        .head(10)
+    )
     fig2 = px.bar(by_region, x="region", y="count", title="상위 지역별 공매 건수 (Top10)")
     st.plotly_chart(fig2, use_container_width=True)
 
 with col3:
-    filtered["week"] = filtered["start_date"].dt.to_period("W").astype(str)
-    by_week = filtered.groupby("week").size().reset_index(name="count")
+    tmp = filtered.copy()
+    tmp["week"] = tmp["start_date"].dt.to_period("W").astype(str)
+    by_week = tmp.groupby("week").size().reset_index(name="count")
     fig3 = px.line(by_week, x="week", y="count", markers=True, title="주간 공매 건수 추이")
     st.plotly_chart(fig3, use_container_width=True)
 
 st.subheader("지도 (선택)")
 if st.checkbox("지역 분포 지도 보기", value=False):
-    map_df = filtered.dropna(subset=["lat","lon"])[["lat","lon"]]
+    map_df = filtered.dropna(subset=["lat", "lon"])[["lat", "lon"]]
     st.map(map_df)
 
 st.subheader("공매 물건 목록")
 st.dataframe(
-    filtered[["item_id","region","auction_type","status","start_date","end_date","min_price","appraised_price","address"]]
+    filtered[
+        ["item_id", "region", "auction_type", "status", "start_date", "end_date", "min_price", "appraised_price", "address"]
+    ]
     .sort_values("start_date", ascending=False)
     .reset_index(drop=True),
     use_container_width=True
