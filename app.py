@@ -7,7 +7,7 @@ from fetch_onbid import fetch_onbid_sample  # ← 루트의 fetch_onbid.py에서
 
 st.set_page_config(page_title="공매 진행현황 대시보드", layout="wide")
 
-st.title("📊 공매 진행현황 대시보드 (온비드 기반) — 쉬운 버전")
+st.title("📊 공매 진행현황 대시보드")
 st.caption("샘플 데이터를 사용합니다. 실제 API 연동은 fetch_onbid.py를 참고하세요.")
 
 @st.cache_data
