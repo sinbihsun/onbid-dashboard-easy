@@ -1,4 +1,4 @@
-# app.py — 온비드 공매 대시보드 (담당자 필터 / 단일 CSV 지원)
+# app.py — 온비드 공매 대시보드 (담당자 필터 / 단일 CSV 지원 / 견고한 전처리)
 import streamlit as st
 import pandas as pd
 from pathlib import Path
@@ -7,12 +7,24 @@ import numpy as np
 
 st.set_page_config(page_title="🏦 온비드 공매 대시보드 (담당자 필터)", layout="wide")
 
-
 # -----------------------------
 # 0) 유틸: CSV 안전 로더
 # -----------------------------
 def read_csv_robust(src):
-    """utf-8-sig, utf-8, cp949 순으로 시도해서 안전하게 읽기"""
+    """
+    utf-8-sig, utf-8, cp949 순으로 시도.
+    업로드 파일(파일 객체)일 경우엔 먼저 인코딩 옵션 없이 시도.
+    """
+    # UploadedFile 같은 파일 객체 처리
+    if hasattr(src, "read"):
+        try:
+            return pd.read_csv(src)
+        except Exception:
+            src.seek(0)  # 파일 포인터 복구
+            # 파일 객체에 인코딩 지정은 드뭄. 실패 시 한 번 더 기본으로 시도.
+            return pd.read_csv(src)
+
+    # 경로(str/Path) 처리
     encodings = ["utf-8-sig", "utf-8", "cp949"]
     last_err = None
     for enc in encodings:
@@ -23,16 +35,15 @@ def read_csv_robust(src):
             continue
     raise last_err
 
-
 # -----------------------------
 # 1) 로더: 다양한 파일명/위치를 탐색
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def load_df():
     here = Path(__file__).resolve().parent
-    cwd = Path.cwd()
+    cwd  = Path.cwd()
 
-    # 가능한 파일 후보 (현재 리포 구조에 맞춰 sample_onbid.csv가 최우선)
+    # 가능한 파일 후보 (리포 루트의 sample_onbid.csv가 최우선)
     candidate_files = [
         here / "sample_onbid.csv",
         cwd / "sample_onbid.csv",
@@ -48,7 +59,7 @@ def load_df():
         if p.exists():
             return read_csv_robust(p)
 
-    # 못 찾으면 업로더 제공
+    # 못 찾으면 업로드 유도
     st.warning(
         "데이터 CSV 파일을 찾지 못했습니다. 아래 경로에서 탐색했습니다:\n\n- "
         + "\n- ".join(searched)
@@ -59,7 +70,6 @@ def load_df():
         return read_csv_robust(uploaded)
     st.stop()
 
-
 # -----------------------------------
 # 2) 전처리: 컬럼이 부족해도 안전하게 채우기
 # -----------------------------------
@@ -69,11 +79,16 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     # ---------- 기본 컬럼 보강 ----------
     if "case_id" not in df.columns:
         df["case_id"] = [f"C{i:04d}" for i in range(1, len(df) + 1)]
-    df.setdefault("name_masked", "가*")
-    df.setdefault("officer", "미지정")
-    df.setdefault("region", "미정")
-    df.setdefault("district", "미정")
-    df.setdefault("stage", "미정")
+    if "name_masked" not in df.columns:
+        df["name_masked"] = "가*"
+    if "officer" not in df.columns:
+        df["officer"] = "미지정"
+    if "region" not in df.columns:
+        df["region"] = "미정"
+    if "district" not in df.columns:
+        df["district"] = "미정"
+    if "stage" not in df.columns:
+        df["stage"] = "미정"
 
     # amount_total 없으면 추정(숫자형 'amount/금액' 컬럼 합)
     if "amount_total" not in df.columns:
@@ -92,7 +107,7 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
                 return c
         return None
 
-    # 체납 기준일 후보(당신 CSV에 맞춰 추가 가능)
+    # 체납 기준일 후보(필요 시 컬럼명 추가)
     delinquent_col = pick_date(
         ["delinquent_since", "체납일자", "체납일", "arrears_since", "delinquentDate"]
     )
@@ -120,7 +135,7 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     # ---------- 공매 금액/비율 ----------
     df["appraisal_price"] = pd.to_numeric(df.get("appraisal_price"), errors="coerce")
-    df["min_bid_price"] = pd.to_numeric(df.get("min_bid_price"), errors="coerce")
+    df["min_bid_price"]   = pd.to_numeric(df.get("min_bid_price"), errors="coerce")
     with np.errstate(invalid="ignore", divide="ignore"):
         df["min_ratio"] = (df["min_bid_price"] / df["appraisal_price"]).round(4)
 
@@ -137,10 +152,10 @@ def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
         df["match_status"] = "unlinked"
 
     # 링크 기본값
-    df.setdefault("source_url", "")
+    if "source_url" not in df.columns:
+        df["source_url"] = ""
 
     return df
-
 
 # ===================================
 # 3) 메인: 데이터 로드 & 전처리
@@ -209,6 +224,6 @@ st.download_button(
 )
 
 st.caption(
-    "※ 현재는 루트의 sample_onbid.csv 하나만으로도 동작합니다. "
+    "※ 루트의 sample_onbid.csv 하나로도 동작합니다. "
     "실무 적용 시 컬럼 표준화 및 주소 매칭/지표 계산을 강화하세요."
 )
