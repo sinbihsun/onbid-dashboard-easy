@@ -7,10 +7,16 @@ st.set_page_config(page_title="🏦 부동산 공매 통합 대시보드", layou
 
 @st.cache_data
 def load():
-    base = Path(__file__).resolve().parent.parent / "data"
+    from pathlib import Path
+    import pandas as pd
+
+    # ✅ app.py가 리포지토리 루트에 있을 때
+    base = Path(__file__).resolve().parent / "data"
+
     internal = pd.read_csv(base / "internal_export_sample.csv")
     auction  = pd.read_csv(base / "auction_list_sample.csv")
     return internal, auction
+
 
 def street_no(addr: str):
     try:
