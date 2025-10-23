@@ -1,85 +1,124 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
+from pathlib import Path
 from datetime import datetime
-from dateutil.parser import parse
-from fetch_onbid import fetch_onbid_sample  # ← 루트의 fetch_onbid.py에서 임포트
 
-st.set_page_config(page_title="공매 진행현황 대시보드", layout="wide")
-
-st.title("📊 공매 진행현황 대시보드")
-st.caption("샘플 데이터를 사용합니다. 실제 API 연동은 fetch_onbid.py를 참고하세요.")
+st.set_page_config(page_title="🏦 부동산 공매 통합 대시보드", layout="wide")
 
 @st.cache_data
-def load_data():
-    df = fetch_onbid_sample(token="SAMPLE_TOKEN")
-    for col in ["start_date", "end_date"]:
-        df[col] = pd.to_datetime(df[col], errors="coerce")
-    return df
+def load():
+    base = Path(__file__).resolve().parent.parent / "data"
+    internal = pd.read_csv(base / "internal_export_sample.csv")
+    auction  = pd.read_csv(base / "auction_list_sample.csv")
+    return internal, auction
 
-df = load_data()
+def street_no(addr: str):
+    try:
+        return int(str(addr).split("테스트로")[-1].strip())
+    except Exception:
+        return None
+
+def preprocess(internal, auction):
+    # 간이 주소 매칭용 street_no
+    internal["street_no"] = internal["address"].apply(street_no)
+    auction["street_no"]  = auction["property_address"].apply(street_no)
+
+    merged = pd.merge(
+        internal, auction,
+        on=["region","district","street_no"],
+        how="left", suffixes=("", "_auc")
+    )
+
+    # 파생 지표
+    today = pd.Timestamp(datetime.today().date())
+    merged["delinquent_since"] = pd.to_datetime(merged["delinquent_since"], errors="coerce")
+    merged["days_delinquent"] = (today - merged["delinquent_since"]).dt.days
+    merged["penalty_ratio"] = (merged["amount_penalty"] / merged["amount_total"]).round(4)
+
+    merged["appraisal_price"] = pd.to_numeric(merged.get("appraisal_price"), errors="coerce")
+    merged["min_bid_price"]   = pd.to_numeric(merged.get("min_bid_price"), errors="coerce")
+    merged["min_ratio"] = (merged["min_bid_price"] / merged["appraisal_price"]).round(4)
+
+    merged["bid_end"] = pd.to_datetime(merged.get("bid_end"), errors="coerce")
+    merged["time_pressure"] = (merged["bid_end"] - today).dt.days
+    merged["match_status"] = merged["item_id"].notna().map({True:"linked", False:"unlinked"})
+
+    # 간이 우선순위
+    stage_score = {"독촉":0.3,"최고":0.45,"압류":0.7,"공매신청":0.85,"공매진행":1.0}
+    asset_score = {"부동산":1.0,"예금":0.8,"차량":0.6,"기타":0.4}
+    merged["collectability_proxy"] = merged["stage"].map(stage_score).fillna(0.4) + \
+                                     merged["asset_flag"].map(asset_score).fillna(0.3)
+    amt_norm = (merged["amount_total"] / merged["amount_total"].max()).fillna(0)
+    merged["priority_score"] = (
+        0.6*amt_norm
+        + 0.3*merged["collectability_proxy"]
+        + 0.1*(-merged["time_pressure"].fillna(30).clip(-30,30)/30)
+    ).round(4)
+    try:
+        merged["priority_tier"] = pd.qcut(merged["priority_score"], 3, labels=["C","B","A"])
+    except Exception:
+        merged["priority_tier"] = "B"
+
+    return merged
+
+# 데이터 로드 & 전처리
+internal, auction = load()
+df = preprocess(internal.copy(), auction.copy())
+
+# =======================
+#     사이드바 필터
+# =======================
+st.title("🏦 부동산 공매 통합 대시보드 (담당자 필터)")
 
 st.sidebar.header("필터")
-regions = ["전체"] + sorted(df["region"].dropna().unique().tolist())
-region_sel = st.sidebar.selectbox("지역", regions)
+# ✅ 담당자 이름 기반 필터
+my_name = st.sidebar.text_input("내 이름(담당자)", value="", help="예: 김주무 / '김' 처럼 부분 입력도 가능")
+only_mine = st.sidebar.checkbox("내가 관리하는 케이스만 보기", value=True)
 
-types = ["전체"] + sorted(df["auction_type"].dropna().unique().tolist())
-type_sel = st.sidebar.selectbox("공매종류", types)
+stages  = st.sidebar.multiselect("진행단계", sorted(df["stage"].dropna().unique()))
+tiers   = st.sidebar.multiselect("우선순위", ["A","B","C"])
+due_in  = st.sidebar.slider("공매 마감 D-일 이내", 0, 30, 7)
 
-statuses = ["전체"] + sorted(df["status"].dropna().unique().tolist())
-status_sel = st.sidebar.selectbox("진행상태", statuses)
+# 필터 적용
+f = df.copy()
 
-min_date = pd.to_datetime(df["start_date"].min())
-max_date = pd.to_datetime(df["end_date"].max())
-if pd.isna(min_date) or pd.isna(max_date):
-    min_date = pd.to_datetime("2025-01-01")
-    max_date = pd.to_datetime(datetime.today().date())
-date_range = st.sidebar.date_input("기간 (시작/종료)", value=(min_date.date(), max_date.date()))
+# ✅ 담당자 필터 (부분일치, 대소문자 무시)
+if only_mine and my_name.strip():
+    patt = my_name.strip()
+    f = f[f["officer"].astype(str).str.contains(patt, case=False, na=False)]
 
-filtered = df.copy()
-if region_sel != "전체":
-    filtered = filtered[filtered["region"] == region_sel]
-if type_sel != "전체":
-    filtered = filtered[filtered["auction_type"] == type_sel]
-if status_sel != "전체":
-    filtered = filtered[filtered["status"] == status_sel]
-if isinstance(date_range, tuple) and len(date_range) == 2:
-    start_d, end_d = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
-    filtered = filtered[(filtered["start_date"] >= start_d) & (filtered["end_date"] <= end_d)]
+if stages:
+    f = f[f["stage"].isin(stages)]
+if tiers:
+    f = f[f["priority_tier"].isin(tiers)]
 
-st.markdown(f"**총 {len(filtered):,}건**이 필터에 해당합니다.")
+f["due_days"] = (f["bid_end"] - pd.Timestamp.today()).dt.days
+f = f[(f["due_days"] <= due_in) | f["due_days"].isna()]
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    by_status = filtered["status"].value_counts().reset_index()
-    by_status.columns = ["status", "count"]
-    fig = px.pie(by_status, names="status", values="count", title="진행상태 비율")
-    st.plotly_chart(fig, use_container_width=True)
+# =======================
+#          KPI
+# =======================
+c1, c2, c3 = st.columns(3)
+c1.metric("총 체납액(만원)", int(f["amount_total"].sum()/10000) if len(f) else 0)
+c2.metric("공매 연계 건수", int((f["match_status"]=="linked").sum()) if len(f) else 0)
+c3.metric("A등급 수", int((f["priority_tier"]=="A").sum()) if len(f) else 0)
 
-with col2:
-    by_region = (
-        filtered.groupby("region").size().reset_index(name="count")
-        .sort_values("count", ascending=False).head(10)
-    )
-    fig2 = px.bar(by_region, x="region", y="count", title="상위 지역별 공매 건수 (Top10)")
-    st.plotly_chart(fig2, use_container_width=True)
+# =======================
+#        결과 테이블
+# =======================
+st.markdown("### 결과 목록")
+cols = [
+    "case_id","name_masked","officer","region","district","stage",
+    "amount_total","priority_tier","min_ratio","bid_end","match_status","source_url"
+]
+show_cols = [c for c in cols if c in f.columns]
+st.dataframe(f[show_cols], use_container_width=True)
 
-with col3:
-    tmp = filtered.copy()
-    tmp["week"] = tmp["start_date"].dt.to_period("W").astype(str)
-    by_week = tmp.groupby("week").size().reset_index(name="count")
-    fig3 = px.line(by_week, x="week", y="count", markers=True, title="주간 공매 건수 추이")
-    st.plotly_chart(fig3, use_container_width=True)
-
-st.subheader("지도 (선택)")
-if st.checkbox("지역 분포 지도 보기", value=False):
-    map_df = filtered.dropna(subset=["lat", "lon"])[["lat", "lon"]]
-    st.map(map_df)
-
-st.subheader("공매 물건 목록")
-st.dataframe(
-    filtered[
-        ["item_id","region","auction_type","status","start_date","end_date","min_price","appraised_price","address"]
-    ].sort_values("start_date", ascending=False).reset_index(drop=True),
-    use_container_width=True
+st.download_button(
+    "필터 결과 CSV 다운로드",
+    f.to_csv(index=False).encode("utf-8-sig"),
+    "auction_dashboard_filtered.csv",
+    "text/csv"
 )
+
+st.caption("※ 주소 매칭은 데모용 규칙(‘테스트로 + 번지’)입니다. 실무 적용 시 정규화/유사도 매칭을 권장합니다.")
