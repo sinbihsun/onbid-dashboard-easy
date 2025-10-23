@@ -3,119 +3,145 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime
 
-st.set_page_config(page_title="🏦 부동산 공매 통합 대시보드", layout="wide")
+st.set_page_config(page_title="🏦 온비드 공매 대시보드 (담당자 필터)", layout="wide")
 
-@st.cache_data
-def load():
-    from pathlib import Path
-    import pandas as pd
+# -----------------------------
+# 1) 로더: 다양한 파일명/위치를 탐색
+# -----------------------------
+@st.cache_data(show_spinner=False)
+def load_df():
+    here = Path(__file__).resolve().parent
+    cwd  = Path.cwd()
 
-    # ✅ app.py가 리포지토리 루트에 있을 때
-    base = Path(__file__).resolve().parent / "data"
+    # 가능한 파일 후보 (당신의 리포 구조에 맞춰 sample_onbid.csv가 최우선)
+    candidate_files = [
+        here / "sample_onbid.csv",
+        cwd / "sample_onbid.csv",
+        here / "data" / "sample_onbid.csv",
+        here / "data" / "cases_enriched_sample.csv",
+        here / "data" / "internal_export_sample.csv",  # 있으면 단일 파일로 간주
+    ]
 
-    internal = pd.read_csv(base / "internal_export_sample.csv")
-    auction  = pd.read_csv(base / "auction_list_sample.csv")
-    return internal, auction
+    looked = []
+    for p in candidate_files:
+        looked.append(str(p))
+        if p.exists():
+            return pd.read_csv(p)
 
-
-def street_no(addr: str):
-    try:
-        return int(str(addr).split("테스트로")[-1].strip())
-    except Exception:
-        return None
-
-def preprocess(internal, auction):
-    # 간이 주소 매칭용 street_no
-    internal["street_no"] = internal["address"].apply(street_no)
-    auction["street_no"]  = auction["property_address"].apply(street_no)
-
-    merged = pd.merge(
-        internal, auction,
-        on=["region","district","street_no"],
-        how="left", suffixes=("", "_auc")
+    # 못 찾으면 업로드 유도
+    st.error(
+        "데이터 CSV 파일을 찾지 못했습니다.\n"
+        "다음 경로들에서 찾았습니다:\n- " + "\n- ".join(looked) +
+        "\n\n리포 루트에 sample_onbid.csv를 두거나, 아래에서 CSV를 업로드하세요."
     )
+    uploaded = st.file_uploader("CSV 업로드", type=["csv"])
+    if uploaded is not None:
+        return pd.read_csv(uploaded)
+    st.stop()
 
-    # 파생 지표
+# -----------------------------------
+# 2) 전처리: 컬럼이 부족해도 안전하게 채우기
+# -----------------------------------
+def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # 필요한 대표 컬럼들(없으면 기본값 생성)
+    if "case_id" not in df.columns:
+        df["case_id"] = [f"C{i:04d}" for i in range(1, len(df)+1)]
+    if "name_masked" not in df.columns:
+        df["name_masked"] = "가*"
+    if "officer" not in df.columns:
+        df["officer"] = "미지정"
+    if "region" not in df.columns:
+        df["region"] = "미정"
+    if "district" not in df.columns:
+        df["district"] = "미정"
+    if "stage" not in df.columns:
+        df["stage"] = "미정"
+    if "amount_total" not in df.columns:
+        # 금액 관련 컬럼이 있으면 합쳐서 추정
+        cand = [c for c in df.columns if "amount" in c or "금액" in c]
+        if cand:
+            df["amount_total"] = df[cand].select_dtypes("number").sum(axis=1)
+        else:
+            df["amount_total"] = 0
+
+    # 공매 관련 값
+    if "appraisal_price" not in df.columns:
+        df["appraisal_price"] = pd.NA
+    if "min_bid_price" not in df.columns:
+        df["min_bid_price"] = pd.NA
+    if "bid_end" not in df.columns:
+        df["bid_end"] = pd.NA
+    if "source_url" not in df.columns:
+        df["source_url"] = ""
+
+    # 타입/파생
     today = pd.Timestamp(datetime.today().date())
-    merged["delinquent_since"] = pd.to_datetime(merged["delinquent_since"], errors="coerce")
-    merged["days_delinquent"] = (today - merged["delinquent_since"]).dt.days
-    merged["penalty_ratio"] = (merged["amount_penalty"] / merged["amount_total"]).round(4)
+    df["delinquent_since"] = pd.to_datetime(df.get("delinquent_since"), errors="coerce")
+    df["days_delinquent"] = (today - df["delinquent_since"]).dt.days
 
-    merged["appraisal_price"] = pd.to_numeric(merged.get("appraisal_price"), errors="coerce")
-    merged["min_bid_price"]   = pd.to_numeric(merged.get("min_bid_price"), errors="coerce")
-    merged["min_ratio"] = (merged["min_bid_price"] / merged["appraisal_price"]).round(4)
+    df["appraisal_price"] = pd.to_numeric(df["appraisal_price"], errors="coerce")
+    df["min_bid_price"]   = pd.to_numeric(df["min_bid_price"], errors="coerce")
+    df["min_ratio"] = (df["min_bid_price"] / df["appraisal_price"]).round(4)
 
-    merged["bid_end"] = pd.to_datetime(merged.get("bid_end"), errors="coerce")
-    merged["time_pressure"] = (merged["bid_end"] - today).dt.days
-    merged["match_status"] = merged["item_id"].notna().map({True:"linked", False:"unlinked"})
+    df["bid_end"] = pd.to_datetime(df["bid_end"], errors="coerce")
+    df["due_days"] = (df["bid_end"] - today).dt.days
 
-    # 간이 우선순위
-    stage_score = {"독촉":0.3,"최고":0.45,"압류":0.7,"공매신청":0.85,"공매진행":1.0}
-    asset_score = {"부동산":1.0,"예금":0.8,"차량":0.6,"기타":0.4}
-    merged["collectability_proxy"] = merged["stage"].map(stage_score).fillna(0.4) + \
-                                     merged["asset_flag"].map(asset_score).fillna(0.3)
-    amt_norm = (merged["amount_total"] / merged["amount_total"].max()).fillna(0)
-    merged["priority_score"] = (
-        0.6*amt_norm
-        + 0.3*merged["collectability_proxy"]
-        + 0.1*(-merged["time_pressure"].fillna(30).clip(-30,30)/30)
-    ).round(4)
+    # 간이 우선순위 (금액 기준)
     try:
-        merged["priority_tier"] = pd.qcut(merged["priority_score"], 3, labels=["C","B","A"])
+        q = pd.qcut(df["amount_total"].fillna(0), 3, labels=["C","B","A"])
+        df["priority_tier"] = q
     except Exception:
-        merged["priority_tier"] = "B"
+        df["priority_tier"] = "B"
 
-    return merged
+    # 매칭 여부가 없으면 기본 "unlinked"
+    if "match_status" not in df.columns:
+        df["match_status"] = "unlinked"
 
-# 데이터 로드 & 전처리
-internal, auction = load()
-df = preprocess(internal.copy(), auction.copy())
+    return df
 
-# =======================
-#     사이드바 필터
-# =======================
-st.title("🏦 부동산 공매 통합 대시보드 (담당자 필터)")
+# 데이터 로드 & 정리
+raw = load_df()
+df = ensure_columns(raw)
+
+# -----------------------------------
+# 3) 사이드바 필터 (A 방식: 담당자)
+# -----------------------------------
+st.title("🏦 온비드 공매 대시보드 (담당자 필터)")
 
 st.sidebar.header("필터")
-# ✅ 담당자 이름 기반 필터
-my_name = st.sidebar.text_input("내 이름(담당자)", value="", help="예: 김주무 / '김' 처럼 부분 입력도 가능")
+my_name = st.sidebar.text_input("내 이름(담당자)", value="", help="예: 김주무 (부분 입력 가능)")
 only_mine = st.sidebar.checkbox("내가 관리하는 케이스만 보기", value=True)
 
-stages  = st.sidebar.multiselect("진행단계", sorted(df["stage"].dropna().unique()))
-tiers   = st.sidebar.multiselect("우선순위", ["A","B","C"])
-due_in  = st.sidebar.slider("공매 마감 D-일 이내", 0, 30, 7)
+stages = sorted(df["stage"].dropna().unique().tolist())
+tiers  = ["A","B","C"]
+sel_stages = st.sidebar.multiselect("진행단계", stages)
+sel_tiers  = st.sidebar.multiselect("우선순위", tiers)
+due_in     = st.sidebar.slider("공매 마감 D-일 이내", 0, 60, 7)
 
-# 필터 적용
 f = df.copy()
-
-# ✅ 담당자 필터 (부분일치, 대소문자 무시)
 if only_mine and my_name.strip():
     patt = my_name.strip()
     f = f[f["officer"].astype(str).str.contains(patt, case=False, na=False)]
-
-if stages:
-    f = f[f["stage"].isin(stages)]
-if tiers:
-    f = f[f["priority_tier"].isin(tiers)]
-
-f["due_days"] = (f["bid_end"] - pd.Timestamp.today()).dt.days
+if sel_stages:
+    f = f[f["stage"].isin(sel_stages)]
+if sel_tiers:
+    f = f[f["priority_tier"].isin(sel_tiers)]
 f = f[(f["due_days"] <= due_in) | f["due_days"].isna()]
 
-# =======================
-#          KPI
-# =======================
+# -----------------------------------
+# 4) KPI + 테이블
+# -----------------------------------
 c1, c2, c3 = st.columns(3)
-c1.metric("총 체납액(만원)", int(f["amount_total"].sum()/10000) if len(f) else 0)
+c1.metric("총 체납액(만원)", int(f["amount_total"].fillna(0).sum()/10000) if len(f) else 0)
 c2.metric("공매 연계 건수", int((f["match_status"]=="linked").sum()) if len(f) else 0)
 c3.metric("A등급 수", int((f["priority_tier"]=="A").sum()) if len(f) else 0)
 
-# =======================
-#        결과 테이블
-# =======================
 st.markdown("### 결과 목록")
 cols = [
     "case_id","name_masked","officer","region","district","stage",
-    "amount_total","priority_tier","min_ratio","bid_end","match_status","source_url"
+    "amount_total","min_ratio","bid_end","priority_tier","match_status","source_url"
 ]
 show_cols = [c for c in cols if c in f.columns]
 st.dataframe(f[show_cols], use_container_width=True)
@@ -127,4 +153,4 @@ st.download_button(
     "text/csv"
 )
 
-st.caption("※ 주소 매칭은 데모용 규칙(‘테스트로 + 번지’)입니다. 실무 적용 시 정규화/유사도 매칭을 권장합니다.")
+st.caption("※ 현재는 루트의 sample_onbid.csv 하나만으로 동작합니다. 실무 적용 시 컬럼명을 표준화하고 주소 매칭/지표 계산을 강화하세요.")
